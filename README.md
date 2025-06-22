@@ -6,8 +6,11 @@ The main goal is to assist students in finding and managing suitable study group
 
 # Technologies Used
   PostgreSQL as the database system
+  
   PL/pgSQL for implementing database logic
+  
   Backend: PHP
+  
   Frontend: Html, CSS, Javascript
 
 # Database Functionality
