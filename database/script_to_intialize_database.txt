@@ -1,0 +1,828 @@
+//Below is a script to intitialize the database
+
+1. Table Students
+
+CREATE TABLE fsrif.students
+(
+    sid integer NOT NULL GENERATED ALWAYS AS IDENTITY ( INCREMENT 1 START 1 MINVALUE 1 MAXVALUE 2147483647 CACHE 1 ),
+    name text COLLATE pg_catalog."default" NOT NULL,
+    password character varying COLLATE pg_catalog."default" NOT NULL,
+    admin boolean NOT NULL DEFAULT false,
+    CONSTRAINT students_pkey PRIMARY KEY (sid)
+)
+
+TABLESPACE pg_default;
+
+ALTER TABLE fsrif.students
+    OWNER to postgres;
+
+
+2. Table Meetings
+
+
+CREATE TABLE fsrif.meetings
+(
+    mid integer NOT NULL GENERATED ALWAYS AS IDENTITY ( INCREMENT 1 START 1 MINVALUE 1 MAXVALUE 2147483647 CACHE 1 ),
+    place text COLLATE pg_catalog."default" NOT NULL,
+    visibility boolean NOT NULL DEFAULT false,
+    date date,
+    start_time time without time zone,
+    end_time time without time zone,
+    CONSTRAINT meetings_pkey PRIMARY KEY (mid)
+)
+
+TABLESPACE pg_default;
+
+ALTER TABLE fsrif.meetings
+    OWNER to postgres;
+
+3. Table study groups
+
+CREATE TABLE fsrif.study_groups
+(
+    sgid integer NOT NULL GENERATED ALWAYS AS IDENTITY ( INCREMENT 1 START 1 MINVALUE 1 MAXVALUE 2147483647 CACHE 1 ),
+    topic text COLLATE pg_catalog."default" NOT NULL,
+    description text COLLATE pg_catalog."default" NOT NULL,
+    count integer NOT NULL,
+    meeting_id integer NOT NULL,
+    CONSTRAINT study_groups_pkey PRIMARY KEY (sgid),
+    CONSTRAINT meeting_fkey FOREIGN KEY (meeting_id)
+        REFERENCES fsrif.meetings (mid) MATCH SIMPLE
+        ON UPDATE CASCADE
+        ON DELETE CASCADE
+        NOT VALID,
+    CONSTRAINT members_count CHECK (count >= 2) NOT VALID
+)
+
+TABLESPACE pg_default;
+
+ALTER TABLE fsrif.study_groups
+    OWNER to postgres;
+
+
+
+4. Table members
+
+CREATE TABLE fsrif.members
+(
+    gmid integer NOT NULL GENERATED ALWAYS AS IDENTITY ( INCREMENT 1 START 1 MINVALUE 1 MAXVALUE 2147483647 CACHE 1 ),
+    student_id integer NOT NULL,
+    study_group_id integer NOT NULL,
+    date date NOT NULL,
+    "time" time without time zone NOT NULL,
+    isowner boolean NOT NULL DEFAULT false,
+    CONSTRAINT members_pkey PRIMARY KEY (gmid),
+    CONSTRAINT student_ukey UNIQUE (student_id)
+        INCLUDE(gmid, study_group_id),
+    CONSTRAINT student_fkey FOREIGN KEY (student_id)
+        REFERENCES fsrif.students (sid) MATCH SIMPLE
+        ON UPDATE CASCADE
+        ON DELETE CASCADE
+        NOT VALID,
+    CONSTRAINT study_group_fkey FOREIGN KEY (study_group_id)
+        REFERENCES fsrif.study_groups (sgid) MATCH SIMPLE
+        ON UPDATE CASCADE
+        ON DELETE CASCADE
+        NOT VALID
+)
+
+TABLESPACE pg_default;
+
+ALTER TABLE fsrif.members
+    OWNER to postgres;
+
+
+**************************************************************************************************************************************
+
+//Below is a script to create functions in plpgsql
+
+1. addnewmeeting
+
+CREATE OR REPLACE FUNCTION fsrif.addnewmeeting(
+	mdate date,
+	place text,
+	start_time time without time zone,
+	end_time time without time zone)
+    RETURNS character varying
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+AS $BODY$
+begin
+  if mdate<now()::date then
+     raise 'Meeting date cannot be set into the past';
+  end if;
+    
+  if mdate=now()::date and start_time<now()::time then
+     raise 'Meeting start time cannot be set into the past';
+  end if;
+  
+  if start_time>end_time then
+     raise 'Meeting End time cannot be set before Start time';
+   else
+     insert into meetings(date,place,start_time,end_time) values(mdate,place,start_time,end_time);
+	 return 'Meeting added!';
+  end if;
+end;
+$BODY$;
+
+ALTER FUNCTION fsrif.addnewmeeting(date, text, time without time zone, time without time zone)
+    OWNER TO postgres;
+
+
+
+2. addstudygroups
+
+CREATE OR REPLACE FUNCTION fsrif.addstudygroup(
+	studentid integer,
+	meetingid integer,
+	s_topic text,
+	s_description text,
+	s_count integer)
+    RETURNS character varying
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+AS $BODY$
+declare
+--new study group id
+sgi_id integer;
+
+--old group member id
+ogm_id integer;
+
+--old study group id
+osg_id integer;
+
+--new owner id
+nom_id integer;
+begin
+	if s_count<2 then
+  		raise 'Number of participants cannot be less than 2';
+	else
+		--Check first if the new group owner is already a member of any group
+		--for this firt get membership id
+		 select gmid into ogm_id from members where student_id=studentid;
+		
+		--the creator is already member
+		if found then
+			 -- check if the creator is already owner too
+			 perform * from members where gmid=ogm_id and isowner=true;
+             
+			 -- The creator is owner
+			 if found then
+				
+				-- now before deleting the membership get the group id to assign ownership to the next possible candidate
+			    select study_group_id into osg_id from members where gmid=ogm_id;
+				
+				--now delete the old membership
+				delete from members where gmid=ogm_id;
+				
+				--now we need to check if there are other members in this group otherwise delete the group
+				perform * from members where study_group_id=osg_id;
+				
+				--other members exist
+				if found then
+					 --now we need to sort the members in asceding order to get the next possible member to transfer ownership to
+					 select gmid into nom_id from members where study_group_id=osg_id order by date,time asc fetch first row only;
+                     
+					 -- now assign the ownership to this member
+					 update members set isowner=true where gmid=nom_id;
+					 
+					 -- there are no further members just delete the  group
+					else
+						delete from study_groups where sgid=osg_id;			
+				end if;
+				
+			    -- The creator was just mumber before
+			 else
+			   --only delete membership
+			   delete from members where gmid=ogm_id;
+			 end if;
+		
+		-- if control reaches here directly
+		-- the creator does not own any group nor is member previously
+		end if;
+		
+		--create new study group
+		insert into study_groups(topic,description,count,meeting_id) values(s_topic,s_description,s_count,meetingid) returning sgid into sgi_id;
+	    
+		--insert new membership
+		insert into members(student_id,study_group_id,date,time,isowner) values(studentid,sgi_id,now()::date,now()::time,true);
+	
+		return 'Study Group added & any previous joining has been removed!';
+    end if;
+
+end;
+$BODY$;
+
+ALTER FUNCTION fsrif.addstudygroup(integer, integer, text, text, integer)
+    OWNER TO postgres;
+
+
+
+
+3. changemeetingvisibility
+
+CREATE OR REPLACE FUNCTION fsrif.changemeetingvisibility(
+	)
+    RETURNS void
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+AS $BODY$
+declare
+	meetingid integer;
+	mdate date;
+	starttime time;
+BEGIN
+    FOR meetingid,mdate,starttime IN SELECT mid,date,start_time FROM meetings
+    LOOP
+        if mdate<=now()::date AND starttime<now()::time then
+		   update meetings set visibility=false where mid=meetingid;
+		 end if; 
+    END LOOP;
+	return;
+end;
+$BODY$;
+
+ALTER FUNCTION fsrif.changemeetingvisibility()
+    OWNER TO postgres;
+
+
+
+
+
+4. changemeetingvisibility (overloaded version) 
+
+CREATE OR REPLACE FUNCTION fsrif.changemeetingvisibility(
+	meetingid integer,
+	status boolean)
+    RETURNS character varying
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+AS $BODY$
+begin
+ 
+ if status=true then
+  	update meetings set visibility=true where mid=meetingid;
+ else
+ 	update meetings set visibility=false where mid=meetingid;
+ end if;
+ 
+ if status=true then
+     return 'Success! Visibility changed to show';
+ else
+     return 'Success! Visibility changed to hidden';
+ end if;	 
+
+end;
+$BODY$;
+
+ALTER FUNCTION fsrif.changemeetingvisibility(integer, boolean)
+    OWNER TO postgres;
+
+
+
+5. changename
+
+CREATE OR REPLACE FUNCTION fsrif.changename(
+	studentid integer,
+	nname text)
+    RETURNS text
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+AS $BODY$
+begin
+update students set name=nname where sid=studentid;
+return nname;
+end
+$BODY$;
+
+ALTER FUNCTION fsrif.changename(integer, text)
+    OWNER TO postgres;
+
+
+
+6. deletegroup
+
+CREATE OR REPLACE FUNCTION fsrif.deletegroup(
+	studentid integer,
+	studygroupid integer)
+    RETURNS boolean
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+AS $BODY$
+begin
+
+if isowner(studentid,studygroupid) then
+    delete from study_groups where sgid=studygroupid;
+	return true;
+else
+    raise 'You are not allowed to delete the group';
+end if;	
+
+end;
+$BODY$;
+
+ALTER FUNCTION fsrif.deletegroup(integer, integer)
+    OWNER TO postgres;
+
+
+
+7. deletemeeting
+
+
+CREATE OR REPLACE FUNCTION fsrif.deletemeeting(
+	meetingid integer)
+    RETURNS boolean
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+AS $BODY$
+begin
+		delete from meetings where mid=meetingid AND visibility=false;
+		
+		if found then
+		   return true;
+		else
+		   return false;
+		end if;   
+
+	end;
+$BODY$;
+
+ALTER FUNCTION fsrif.deletemeeting(integer)
+    OWNER TO postgres;
+
+
+
+8. editgroupdata
+
+CREATE OR REPLACE FUNCTION fsrif.editgroupdata(
+	studentid integer,
+	studygroupid integer,
+	s_topic text,
+	s_desscription text,
+	s_count integer)
+    RETURNS character varying
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+AS $BODY$
+begin
+if s_count<2 then
+   return 'Failure, student limit cannot be less than 2';
+else
+  --only allow owner to modify
+  perform * from members where student_id=studentid AND study_group_id=studygroupid AND isowner=true;
+  if found then
+        update study_groups set topic=s_topic,description=s_desscription,count=s_count where sgid=studygroupid;
+		return 'Group attributes changed...';
+	 else
+      	raise 'You are not allowed to edit the group attributes!';
+  end if;
+end if;
+
+end;
+$BODY$;
+
+ALTER FUNCTION fsrif.editgroupdata(integer, integer, text, text, integer)
+    OWNER TO postgres;
+
+
+
+9. editmeeting
+
+CREATE OR REPLACE FUNCTION fsrif.editmeeting(
+	meetingid integer,
+	nplace text,
+	ndate date,
+	nstart time without time zone,
+	nend time without time zone)
+    RETURNS character varying
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+AS $BODY$
+begin
+if ndate<now()::date then
+     raise 'Meeting date cannot be set into the past';
+  end if;
+  
+  if ndate=now()::date and nstart<now()::time then
+     raise 'Meeting start time cannot be set into the past';
+  end if;
+  
+  if nstart>=nend then
+     raise 'Meeting End time cannot be set before Start time';
+   else
+     update meetings set place=nplace,start_time=nstart,end_time=nend,date=ndate where mid=meetingid;
+	 return 'Meeting Edited!';
+  end if;
+
+end
+$BODY$;
+
+ALTER FUNCTION fsrif.editmeeting(integer, text, date, time without time zone, time without time zone)
+    OWNER TO postgres;
+
+
+
+10. getallmeetings
+
+CREATE OR REPLACE FUNCTION fsrif.getallmeetings(
+	)
+    RETURNS TABLE(meetingid integer, mplace text, mvisibility boolean, mdate date, mst time without time zone, met time without time zone) 
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+    ROWS 1000
+
+AS $BODY$
+BEGIN
+   return query select mid,place,visibility,date,start_time,end_time from meetings order by date,start_time asc;
+END
+$BODY$;
+
+ALTER FUNCTION fsrif.getallmeetings()
+    OWNER TO postgres;
+
+
+11. getallstudents
+
+
+CREATE OR REPLACE FUNCTION fsrif.getallstudents(
+	)
+    RETURNS SETOF fsrif.students 
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+    ROWS 1000
+
+AS $BODY$
+DECLARE
+    r students%rowtype;
+BEGIN
+    FOR r IN SELECT * FROM students
+    LOOP
+        RETURN NEXT r;
+    END LOOP;
+    RETURN;
+END
+$BODY$;
+
+ALTER FUNCTION fsrif.getallstudents()
+    OWNER TO postgres;
+
+
+
+
+12. getmembers
+
+CREATE OR REPLACE FUNCTION fsrif.getmembers(
+	studygroupid integer)
+    RETURNS integer
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+AS $BODY$
+declare
+countmembers integer;
+begin
+
+select count(*) into countmembers from members where study_group_id=studygroupid;
+return countmembers;
+
+end;
+$BODY$;
+
+ALTER FUNCTION fsrif.getmembers(integer)
+    OWNER TO postgres;
+
+
+
+13. getstudentid
+
+CREATE OR REPLACE FUNCTION fsrif.getstudentid(
+	susername text,
+	spassword text)
+    RETURNS integer
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+AS $BODY$
+declare
+studentid integer;
+begin
+
+select sid into studentid from students where name=susername and password=spassword; 
+return studentid;
+end;
+$BODY$;
+
+ALTER FUNCTION fsrif.getstudentid(text, text)
+    OWNER TO postgres;
+
+
+
+14. getvisiblemeetings
+
+CREATE OR REPLACE FUNCTION fsrif.getvisiblemeetings(
+	)
+    RETURNS TABLE(meetingid integer, mplace text, mdate date, stime time without time zone, etime time without time zone) 
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+    ROWS 1000
+
+AS $BODY$
+BEGIN
+   return query select mid,place,date,start_time,end_time from meetings where visibility=true order by date,start_time asc;
+END
+$BODY$;
+
+ALTER FUNCTION fsrif.getvisiblemeetings()
+    OWNER TO postgres;
+
+
+
+15. isjoinable
+
+CREATE OR REPLACE FUNCTION fsrif.isjoinable(
+	studygroupid integer)
+    RETURNS boolean
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+AS $BODY$
+declare
+mem_count integer;
+allowed_count integer;
+begin
+        select count into allowed_count from study_groups where sgid=studygroupid;
+	    SELECT COUNT(*) into mem_count FROM members WHERE study_group_id=studygroupid;
+		if mem_count<allowed_count then
+            return true;
+		else
+			return false;
+		end if;   
+end;
+$BODY$;
+
+ALTER FUNCTION fsrif.isjoinable(integer)
+    OWNER TO postgres;
+
+
+
+16. isjoined
+
+CREATE OR REPLACE FUNCTION fsrif.isjoined(
+	studentid integer,
+	studygroupid integer)
+    RETURNS boolean
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+AS $BODY$
+begin
+
+perform * from members where student_id=studentid and study_group_id=studygroupid;
+
+if found then
+  return true;
+else
+return false;
+
+end if;
+end;
+$BODY$;
+
+ALTER FUNCTION fsrif.isjoined(integer, integer)
+    OWNER TO postgres;
+
+
+
+17. isowner
+
+CREATE OR REPLACE FUNCTION fsrif.isowner(
+	studentid integer,
+	studygroupid integer)
+    RETURNS boolean
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+AS $BODY$
+begin
+perform * from members where student_id=studentid and study_group_id=studygroupid and isowner=true;
+
+if found then
+   return true;
+ else
+ 	return false;
+end if;
+
+end;
+$BODY$;
+
+ALTER FUNCTION fsrif.isowner(integer, integer)
+    OWNER TO postgres;
+
+
+
+
+18. joingroup
+
+CREATE OR REPLACE FUNCTION fsrif.joingroup(
+	studentid integer,
+	studygroupid integer)
+    RETURNS boolean
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+AS $BODY$
+declare
+
+--old group member id
+ogm_id integer;
+
+--old study group id
+osg_id integer;
+
+--new owner id
+nom_id integer;
+begin
+      
+	if isjoinable(studygroupid) then
+
+	        --Check first if the student is already a member of any group
+			--for this firt get membership id
+			 select gmid into ogm_id from members where student_id=studentid;
+
+			--the student is already member of other group
+			if found then
+				 -- check if the student is owner too
+				 perform owid from members where gmid=ogm_id AND isowner=true;
+
+				 -- The student is owner
+				 if found then
+
+					-- now before deleting the membership get the group id to assign ownership to the next possible candidate
+					select study_group_id into osg_id from members where gmid=ogm_id;
+
+					--now delete the old membership
+					delete from members where gmid=ogm_id;
+
+					--now we need to check if there are other members in this group otherwise delete the group
+					perform * from members where study_group_id=osg_id;
+
+					--other members exist
+					if found then
+						 --now we need to sort the members in asceding order to get the next possible member to transfer ownership to
+						 select gmid into nom_id from members where study_group_id=osg_id order by date,time asc fetch first row only;
+
+						 -- now assign the ownership to this member
+						 update members set isowner=true where gmid=nom_id;
+
+						 -- there are no further members just delete the  group
+						else
+							delete from study_groups where sgid=osg_id;			
+					end if;
+
+					-- The student was just member before
+				 else
+				   --only delete membership
+				   delete from members where gmid=ogm_id;
+				 end if;
+
+            end if;
+			
+								-- if control reaches here directly
+					-- the student does not own any group nor is member previously
+					--insert new membership
+		       insert into members(student_id,study_group_id,date,time) values(studentid,studygroupid,now()::date,now()::time);
+	    
+    	
+		return true;
+	else
+	    raise 'Group cannot be joined';
+		
+	end if;	
+
+end;
+$BODY$;
+
+ALTER FUNCTION fsrif.joingroup(integer, integer)
+    OWNER TO postgres;
+
+
+
+
+19. leavegroup
+
+CREATE OR REPLACE FUNCTION fsrif.leavegroup(
+	studentid integer,
+	studygroupid integer)
+    RETURNS boolean
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+AS $BODY$
+declare
+
+--old group member id
+ogm_id integer;
+
+--old study group id
+osg_id integer;
+
+--new owner id
+nom_id integer;
+
+--total members in the group to be deleted
+mig integer;
+begin
+
+--check if the student has already joined the group
+--if not joined the group
+	if not isjoined(studentid,studygroupid) then
+		raise 'You have not joined the group';
+	else
+        --check if the leaver is the only one in the group
+		mig = getmembers(studygroupid);
+	
+		--if this is the last member
+		if mig<2 then
+		 --obviously a last member is a owner too, so delete the whole group
+			delete from study_groups where sgid=studygroupid;			
+		else
+			--There are other members too, first figure out if this member is owner
+			select gmid into ogm_id from members where student_id=studentid and isowner=true;
+		
+			-- The student is owner
+			if found then
+
+				-- now before deleting the membership get the group id to assign ownership to the next possible candidate
+				select study_group_id into osg_id from members where gmid=ogm_id;
+
+				--now delete the old membership
+				delete from members where gmid=ogm_id;
+
+				--now we need to sort the members in asceding order to get the next possible member to transfer ownership to
+				select gmid into nom_id from members where study_group_id=osg_id order by date,time asc fetch first row only;
+
+				-- now assign the ownership to this member
+				update members set isowner=true where gmid=nom_id;
+
+				-- The student was just member before
+				 else
+				     --only delete membership
+					 select gmid into ogm_id from members where student_id=studentid and isowner=false;
+				     delete from members where gmid=ogm_id;
+			end if;
+
+		end if;
+
+    end if;
+   
+   return true;
+   
+end;
+$BODY$;
+
+ALTER FUNCTION fsrif.leavegroup(integer, integer)
+    OWNER TO postgres;
+
+
+
+
+20. login
+
+CREATE OR REPLACE FUNCTION fsrif.login(
+	username text,
+	userpassword text,
+	isadmin boolean)
+    RETURNS boolean
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+AS $BODY$
+declare
+r students%rowtype;
+begin
+for r in select * from students
+  loop
+     if r.name=username and userpassword=r.password and r.admin=isadmin then
+	    return true;
+	 end if;
+  end loop;
+  return false;
+end;
+$BODY$;
+
+ALTER FUNCTION fsrif.login(text, text, boolean)
+    OWNER TO postgres;
+ 
